@@ -1,0 +1,48 @@
+# Daily supernova feed for Clear Night Coach (public feed repo).
+# Pulls the TNS public-objects feed with the bot credentials (repo secrets), filters to
+# bright Southern-reachable SNe, and publishes bright_sne.json as a RELEASE ASSET at a
+# stable, anonymously-downloadable URL the app fetches:
+#   https://github.com/icemantis04/cnc-feed/releases/download/sn-feed/bright_sne.json
+#
+# SETUP: three repo secrets (Settings -> Secrets and variables -> Actions):
+#   TNS_BOT_API_KEY   (the bot's API key -- the only real secret)
+#   TNS_BOT_ID        (the numeric bot id)
+#   TNS_BOT_NAME      (the bot's name)
+# TNS throttles repeated full-file downloads, so this runs once a day. Run it manually
+# (Actions tab -> "Run workflow") only sparingly to avoid a 403 cooldown.
+
+name: SN feed
+
+on:
+  schedule:
+    - cron: "30 1 * * *"     # daily, ~01:30 UTC (after TNS regenerates its file post-UT-midnight)
+  workflow_dispatch: {}        # allow manual runs for testing
+
+permissions:
+  contents: write              # to create/update the release asset
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build bright_sne.json from TNS
+        env:
+          TNS_BOT_API_KEY: ${{ secrets.TNS_BOT_API_KEY }}
+          TNS_BOT_ID: ${{ secrets.TNS_BOT_ID }}
+          TNS_BOT_NAME: ${{ secrets.TNS_BOT_NAME }}
+        run: python build_sn_feed.py --out bright_sne.json
+
+      - name: Publish as a release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view sn-feed >/dev/null 2>&1 \
+            || gh release create sn-feed --title "Supernova feed" \
+                 --notes "Daily bright-supernova feed for Clear Night Coach (auto-updated)."
+          gh release upload sn-feed bright_sne.json --clobber
