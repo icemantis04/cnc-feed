@@ -36,12 +36,21 @@ jobs:
           TNS_BOT_API_KEY: ${{ secrets.TNS_BOT_API_KEY }}
           TNS_BOT_ID: ${{ secrets.TNS_BOT_ID }}
           TNS_BOT_NAME: ${{ secrets.TNS_BOT_NAME }}
-        run: python build_sn_feed.py --out bright_sne.json
+        run: |
+          # Remove the in-repo seed so bright_sne.json exists ONLY if this run
+          # freshly built it. A TNS throttle => builder exits clean without writing
+          # => no file => publish step keeps the last-good asset (no failure email).
+          rm -f bright_sne.json
+          python build_sn_feed.py --out bright_sne.json
 
       - name: Publish as a release asset
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [ ! -f bright_sne.json ]; then
+            echo "No fresh feed this run (TNS unavailable) -- keeping the last published asset."
+            exit 0
+          fi
           gh release view sn-feed >/dev/null 2>&1 \
             || gh release create sn-feed --title "Supernova feed" \
                  --notes "Daily bright-supernova feed for Clear Night Coach (auto-updated)."

@@ -44,6 +44,13 @@ ENV_BOT_ID = "TNS_BOT_ID"
 ENV_BOT_NAME = "TNS_BOT_NAME"
 HTTP_TIMEOUT = 30
 
+
+class TNSFetchError(Exception):
+    """A transient TNS download failure (403 throttle / 429 / 503 / network).
+    Distinct from a config error (missing creds): the caller treats this as a
+    SOFT failure -- keep the last-good feed, exit clean, never spam a build alert.
+    Golden rule #5: a network hiccup must never hard-fail the pipeline."""
+
 # --- Feed filter knobs (Southern-tuned v1; widen for the global generalisation) ---
 DEC_MAX = 25.0          # drop clearly-unreachable northern SNe (matches catalog.csv floor)
 FRESH_DAYS = 110        # discovery within this window (the app's per-type decay does the
@@ -119,8 +126,14 @@ def fetch_tns():
                 wait = int(retry_after) if (retry_after and retry_after.isdigit()) else 30 * (attempt + 1)
                 time.sleep(min(wait, 75))
                 continue
-            raise SystemExit(f"TNS fetch failed: HTTP {e.code}. TNS said: {body!r}")
-    raise SystemExit("TNS fetch failed after retries.")
+            raise TNSFetchError(f"TNS fetch failed: HTTP {e.code}. TNS said: {body!r}")
+        except (urllib.error.URLError, OSError) as e:
+            print(f"[fetch] network error on attempt {attempt + 1}/4: {e}", file=sys.stderr)
+            if attempt < 3:
+                time.sleep(30 * (attempt + 1))
+                continue
+            raise TNSFetchError(f"TNS fetch failed (network): {e}")
+    raise TNSFetchError("TNS fetch failed after retries.")
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +269,15 @@ def main():
             csv_text = f.read()
         source = f"TNS (mock: {os.path.basename(args.mock)})"
     else:
-        csv_text = fetch_tns()
+        try:
+            csv_text = fetch_tns()
+        except TNSFetchError as e:
+            # SOFT failure (TNS throttle/network): keep the last-good release asset,
+            # exit clean so the daily cron doesn't fire a build-failure alert. The
+            # workflow only republishes when a fresh file is actually written.
+            print(f"::warning::TNS feed not refreshed this run ({e}). "
+                  "Keeping the last published bright_sne.json.", file=sys.stderr)
+            return
         source = "TNS public objects (wis-tns.org)"
 
     feed = build(csv_text, source)
