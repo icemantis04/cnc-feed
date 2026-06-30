@@ -1,15 +1,19 @@
 # Daily supernova feed for Clear Night Coach (public feed repo).
-# Pulls the TNS public-objects feed with the bot credentials (repo secrets), filters to
-# bright Southern-reachable SNe, and publishes bright_sne.json as a RELEASE ASSET at a
-# stable, anonymously-downloadable URL the app fetches:
+# Pulls the TNS feed with the bot credentials (repo secrets), filters to bright
+# Southern-reachable SNe, and publishes bright_sne.json as a RELEASE ASSET at a stable,
+# anonymously-downloadable URL the app fetches:
 #   https://github.com/icemantis04/cnc-feed/releases/download/sn-feed/bright_sne.json
+#
+# RUNG 2 (2026-06-30): the big FULL-file download kept getting a persistent nginx 403
+# (it's the heavily-contended resource TNS throttles). build_sn_feed.py now DEFAULTS to
+# the small DAILY-DELTA files (a different, far-less-contended endpoint) and merges them
+# with the last-published feed. A throttled/empty run keeps the last-good asset and exits
+# clean (no failure email). Still once a day -- don't hammer it manually.
 #
 # SETUP: three repo secrets (Settings -> Secrets and variables -> Actions):
 #   TNS_BOT_API_KEY   (the bot's API key -- the only real secret)
 #   TNS_BOT_ID        (the numeric bot id)
 #   TNS_BOT_NAME      (the bot's name)
-# TNS throttles repeated full-file downloads, so this runs once a day. Run it manually
-# (Actions tab -> "Run workflow") only sparingly to avoid a 403 cooldown.
 
 name: SN feed
 
