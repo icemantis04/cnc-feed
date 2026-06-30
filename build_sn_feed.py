@@ -236,11 +236,14 @@ def _rows(csv_text):
 
 def _clean_type(raw):
     """TNS type 'SN Ia' -> bare subtype 'Ia' (what the app expects). Leaves 'SLSN-*'
-    intact and maps a bare 'SN'/'AT'/'' to '' (unclassified)."""
+    intact and maps a bare 'SN'/'AT' (the prefix used as a non-classification) to ''
+    (unclassified). A real classification like 'Nova'/'TDE'/'CV'/'Varstar' is LEFT INTACT
+    so the non-SN gate in filter_feed can reject it -- this is NOT a supernova feed
+    component otherwise."""
     t = (raw or "").strip()
     if t.upper().startswith("SN "):
         t = t[3:].strip()
-    if t.upper() in ("SN", "AT", "TDE?"):
+    if t.upper() in ("SN", "AT"):
         t = ""
     return t
 
@@ -278,7 +281,7 @@ def filter_feed(csv_text, today=None):
     today = today or datetime.now(timezone.utc).date()
     out = []
     reader = _rows(csv_text)
-    seen = drop_bad = drop_north = drop_age = drop_faint = 0
+    seen = drop_bad = drop_north = drop_age = drop_faint = drop_nonsn = 0
     for r in reader:
         seen += 1
         try:
@@ -293,7 +296,11 @@ def filter_feed(csv_text, today=None):
             drop_bad += 1
             continue                                 # skip incomplete/garbled rows
         sntype = _clean_type(_get(r, "type"))
+        classified = _classified(sntype)
 
+        if sntype and not classified:                # confirmed NON-supernova transient
+            drop_nonsn += 1                          # (Nova/TDE/CV/Varstar/AGN/...) -- not ours
+            continue
         if dec > DEC_MAX:                            # unreachable north
             drop_north += 1
             continue
@@ -301,7 +308,6 @@ def filter_feed(csv_text, today=None):
         if age < 0 or age > FRESH_DAYS:             # not recent enough
             drop_age += 1
             continue
-        classified = _classified(sntype)
         if mag > (MAG_CLASSIFIED if classified else MAG_UNCLASSIFIED):
             drop_faint += 1
             continue                                 # too faint for its confidence level
@@ -319,8 +325,8 @@ def filter_feed(csv_text, today=None):
     out.sort(key=lambda s: s["mag"])                 # brightest first
     hdr = (reader.fieldnames or [])[:5]
     print(f"[diag] header={hdr} rows_seen={seen} kept={len(out)} | dropped: "
-          f"north={drop_north} stale={drop_age} faint={drop_faint} bad/incomplete={drop_bad}",
-          file=sys.stderr)
+          f"non-SN={drop_nonsn} north={drop_north} stale={drop_age} faint={drop_faint} "
+          f"bad/incomplete={drop_bad}", file=sys.stderr)
     return out
 
 
