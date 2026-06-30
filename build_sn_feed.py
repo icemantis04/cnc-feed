@@ -343,6 +343,27 @@ def build(csv_text, source):
     }
 
 
+def _entry_ok(e, today):
+    """Re-validate a STORED feed entry against the same quality gates filter_feed applies to
+    raw rows. Critical for the rolling accumulator: prior entries are carried forward by
+    `build_deltas`, so without re-checking them, junk that slipped in under an older/looser
+    filter (e.g. a Nova) would stick forever. Re-validating makes the accumulator SELF-HEAL
+    when the gates tighten."""
+    t = e.get("type", "")
+    if t and not _classified(t):                 # confirmed non-SN transient
+        return False
+    if e.get("dec", 0.0) > DEC_MAX:              # unreachable north
+        return False
+    bar = MAG_CLASSIFIED if _classified(t) else MAG_UNCLASSIFIED
+    if e.get("mag", 99.0) > bar:                 # too faint for its confidence level
+        return False
+    try:
+        age = (today - datetime.strptime(e["obs_date"], "%Y-%m-%d").date()).days
+    except (KeyError, ValueError):
+        return False
+    return 0 <= age <= FRESH_DAYS
+
+
 def _desig(name):
     """Dedup key = the bare object DESIGNATION (e.g. '2026xyz'), NOT the full '{prefix} name'.
     The prefix flips AT->SN when a transient gets classified, so keying on the full name would
@@ -363,17 +384,10 @@ def build_deltas(delta_texts, prior_entries, source):
     for text in reversed(delta_texts):          # oldest -> newest so newest info wins
         for e in filter_feed(text):
             acc[_desig(e["name"])] = e
-    kept = []
-    for e in acc.values():
-        try:
-            age = (today - datetime.strptime(e["obs_date"], "%Y-%m-%d").date()).days
-        except (KeyError, ValueError):
-            continue                            # drop anything without a usable obs_date
-        if 0 <= age <= FRESH_DAYS:
-            kept.append(e)
-    kept.sort(key=lambda s: s.get("mag", 99.0))  # brightest first
-    print(f"[diag] merged feed: {len(acc)} candidates -> {len(kept)} kept after age-out "
-          f"(<= {FRESH_DAYS}d)", file=sys.stderr)
+    kept = [e for e in acc.values() if _entry_ok(e, today)]  # self-heal: re-validate ALL
+    kept.sort(key=lambda s: s.get("mag", 99.0))               # brightest first
+    print(f"[diag] merged feed: {len(acc)} candidates -> {len(kept)} kept after re-validation "
+          f"(non-SN / north / faint / >{FRESH_DAYS}d purged)", file=sys.stderr)
     return {
         "schema_version": 1,
         "generated_at": _now_iso(),
