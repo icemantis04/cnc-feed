@@ -56,6 +56,9 @@ ENV_BOT_NAME = "TNS_BOT_NAME"
 HTTP_TIMEOUT = 30
 DELTA_DAYS = 14          # how many daily-delta files to pull (TNS keeps ~2 weeks)
 DELTA_PAUSE = 2.0        # polite seconds between delta requests (don't look like a scraper)
+BLOCK_ABORT = 3          # this many straight failures with NOTHING fetched -> the runner
+                         # is blocked (the 2026-07-01 run 403'd on every delta); stop the
+                         # run instead of hammering the rest of the window
 
 
 class TNSFetchError(Exception):
@@ -174,7 +177,15 @@ def fetch_tns_deltas(days=DELTA_DAYS):
 
     Robust by design: a 404 (no file that day) or an individual throttle SOFT-SKIPS just
     that day -- only the caller decides what to do if NOTHING came through. Returns
-    (list_of_csv_text NEWEST-FIRST, stats dict)."""
+    (list_of_csv_text NEWEST-FIRST, stats dict).
+
+    CIRCUIT BREAKER: when TNS 403-blocks the runner outright (the 2026-07-01 run),
+    every delta fails -- and pressing on through the whole window (x2 attempts +
+    backoff each, ~8 min of requests) is exactly the scraper-shaped traffic that
+    keeps the block warm. If the first few deltas ALL fail with nothing fetched,
+    assume we're blocked and stop for this run; the publish step keeps the
+    last-good asset and tomorrow's schedule retries fresh. A throttle AFTER at
+    least one success stays a per-day soft-skip (unchanged behaviour)."""
     api_key, marker = _credentials()
     texts, got, missing, throttled = [], 0, 0, 0
     today = datetime.now(timezone.utc).date()
@@ -189,6 +200,12 @@ def fetch_tns_deltas(days=DELTA_DAYS):
         except TNSFetchError as e:
             throttled += 1
             print(f"[delta] {d.isoformat()} skipped: {e}", file=sys.stderr)
+            if got == 0 and throttled >= BLOCK_ABORT:
+                print(f"[delta] {throttled} straight failures, nothing fetched -- "
+                      f"TNS is blocking this runner; aborting the remaining deltas "
+                      f"(publish keeps the last-good asset; tomorrow retries).",
+                      file=sys.stderr)
+                break
         if i < days - 1:
             time.sleep(DELTA_PAUSE)            # be a polite client between requests
     print(f"[diag] deltas over {days} days: fetched={got} missing={missing} "
