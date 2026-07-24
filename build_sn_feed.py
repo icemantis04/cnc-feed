@@ -77,7 +77,11 @@ DEC_MAX = 25.0          # drop clearly-unreachable northern SNe (matches catalog
 FRESH_DAYS = 110        # discovery within this window (the app's per-type decay does the
                         # finer cut; this just keeps the published file small)
 MAG_CLASSIFIED = 16.5   # discovery mag ceiling for a spectroscopically classified SN
-MAG_UNCLASSIFIED = 15.5  # stricter bar for unconfirmed "AT" transients (cut the junk)
+# CLASSIFIED-ONLY (2026-07-24): unconfirmed "AT" transients no longer ship AT ALL. The old
+# mag-15.5 "stricter bar" still let AT 2026rdg -- a Galactic classical nova, hostless, blank
+# type at pull time -- ride the feed and render as a "supernova ... in an uncatalogued host
+# galaxy" alert in the app. An AT is by definition not yet a supernova; this feed only
+# publishes what TNS has actually called one (SN prefix or a spectral SN type).
 
 # --- TNS CSV columns we read (looked up tolerantly by name) ---
 COL = {
@@ -298,7 +302,7 @@ def filter_feed(csv_text, today=None):
     today = today or datetime.now(timezone.utc).date()
     out = []
     reader = _rows(csv_text)
-    seen = drop_bad = drop_north = drop_age = drop_faint = drop_nonsn = 0
+    seen = drop_bad = drop_north = drop_age = drop_faint = drop_nonsn = drop_unclass = 0
     for r in reader:
         seen += 1
         try:
@@ -318,6 +322,9 @@ def filter_feed(csv_text, today=None):
         if sntype and not classified:                # confirmed NON-supernova transient
             drop_nonsn += 1                          # (Nova/TDE/CV/Varstar/AGN/...) -- not ours
             continue
+        if not (classified or prefix.upper() == "SN"):
+            drop_unclass += 1                        # unconfirmed AT -- not a supernova (yet)
+            continue
         if dec > DEC_MAX:                            # unreachable north
             drop_north += 1
             continue
@@ -325,9 +332,9 @@ def filter_feed(csv_text, today=None):
         if age < 0 or age > FRESH_DAYS:             # not recent enough
             drop_age += 1
             continue
-        if mag > (MAG_CLASSIFIED if classified else MAG_UNCLASSIFIED):
+        if mag > MAG_CLASSIFIED:
             drop_faint += 1
-            continue                                 # too faint for its confidence level
+            continue                                 # too faint
 
         out.append({
             "name": f"{prefix} {name}".strip(),
@@ -342,8 +349,8 @@ def filter_feed(csv_text, today=None):
     out.sort(key=lambda s: s["mag"])                 # brightest first
     hdr = (reader.fieldnames or [])[:5]
     print(f"[diag] header={hdr} rows_seen={seen} kept={len(out)} | dropped: "
-          f"non-SN={drop_nonsn} north={drop_north} stale={drop_age} faint={drop_faint} "
-          f"bad/incomplete={drop_bad}", file=sys.stderr)
+          f"non-SN={drop_nonsn} unclassified-AT={drop_unclass} north={drop_north} "
+          f"stale={drop_age} faint={drop_faint} bad/incomplete={drop_bad}", file=sys.stderr)
     return out
 
 
@@ -369,10 +376,12 @@ def _entry_ok(e, today):
     t = e.get("type", "")
     if t and not _classified(t):                 # confirmed non-SN transient
         return False
+    name = (e.get("name") or "")
+    if not (_classified(t) or name.upper().startswith("SN ")):
+        return False                             # unconfirmed AT -- not a supernova (yet)
     if e.get("dec", 0.0) > DEC_MAX:              # unreachable north
         return False
-    bar = MAG_CLASSIFIED if _classified(t) else MAG_UNCLASSIFIED
-    if e.get("mag", 99.0) > bar:                 # too faint for its confidence level
+    if e.get("mag", 99.0) > MAG_CLASSIFIED:      # too faint
         return False
     try:
         age = (today - datetime.strptime(e["obs_date"], "%Y-%m-%d").date()).days
@@ -446,13 +455,33 @@ def main():
         prior = [] if args.no_prior else fetch_prior()
         texts, stats = fetch_tns_deltas(args.delta_days)
         if stats["fetched"] == 0:
-            # No fresh delta came through (all throttled/missing). Don't republish -- keep
-            # the last-good asset, exit clean so the daily cron fires no failure alert.
-            print("::warning::No daily deltas fetched this run "
-                  f"(missing={stats['missing']} throttled={stats['throttled']}). "
-                  "Keeping the last published bright_sne.json.", file=sys.stderr)
-            return
-        feed = build_deltas(texts, prior, "TNS daily deltas (wis-tns.org)")
+            # No fresh delta came through (all throttled/missing). Normally keep the
+            # last-good asset and exit clean (no failure alert)... UNLESS re-validating
+            # the published feed against the CURRENT gates would drop entries -- then a
+            # tightened filter (or plain ageing-out) must not stay frozen behind a TNS
+            # block: republish the healed prior-only feed. This is how the classified-only
+            # gate purges junk like AT 2026rdg the same day it lands, block or no block.
+            today = datetime.now(timezone.utc).date()
+            healed = [e for e in prior if _entry_ok(e, today)]
+            if prior and len(healed) < len(prior):
+                healed.sort(key=lambda s: s.get("mag", 99.0))
+                print(f"::warning::No daily deltas fetched "
+                      f"(missing={stats['missing']} throttled={stats['throttled']}), but "
+                      f"re-validation drops {len(prior) - len(healed)} of {len(prior)} "
+                      "carried entries -- republishing the healed feed.", file=sys.stderr)
+                feed = {
+                    "schema_version": 1,
+                    "generated_at": _now_iso(),
+                    "source": "TNS daily deltas (wis-tns.org); prior re-validated, TNS unavailable",
+                    "supernovae": healed,
+                }
+            else:
+                print("::warning::No daily deltas fetched this run "
+                      f"(missing={stats['missing']} throttled={stats['throttled']}). "
+                      "Keeping the last published bright_sne.json.", file=sys.stderr)
+                return
+        else:
+            feed = build_deltas(texts, prior, "TNS daily deltas (wis-tns.org)")
 
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(feed, f, ensure_ascii=False, indent=2)
