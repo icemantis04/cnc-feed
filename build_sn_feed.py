@@ -2,7 +2,7 @@
 build_sn_feed.py -- the SUPERNOVA FEED BUILDER for Clear Night Coach (public feed repo).
 =========================================================================================
 Pulls the Transient Name Server (TNS) public-objects feed, filters it to the bright +
-recent + Southern-reachable supernovae worth surfacing, and writes a tiny `bright_sne.json`
+recent supernovae worth surfacing (full-sky; the app gates per-site visibility), and writes a tiny `bright_sne.json`
 in the shape the Clear Night Coach app consumes. A daily GitHub Actions cron in THIS repo
 runs it with the TNS bot credentials (GitHub secrets, never shipped) and publishes the JSON
 as a release asset the app fetches anonymously.
@@ -72,8 +72,13 @@ class _NotFound(Exception):
     """HTTP 404 on a daily-delta file -- that day simply has no file yet (e.g. today's
     file before TNS regenerates, or a gap). NOT an error: the caller soft-skips it."""
 
-# --- Feed filter knobs (Southern-tuned v1; widen for the global generalisation) ---
-DEC_MAX = 25.0          # drop clearly-unreachable northern SNe (matches catalog.csv floor)
+# --- Feed filter knobs ---
+# FULL-SKY (2026-07-24): the dec ceiling was 25.0 while the app was SH-only ("drop
+# clearly-unreachable northern SNe"). CNC v2 serves both hemispheres from one feed, so
+# the ceiling is gone; the APP now gates per-site visibility on every SN surface
+# (matched hosts need the 30-deg imaging floor at transit, unmatched need GOOD_ALT,
+# never-rises entries are dropped from the callout) -- clear-night-coach 2f92575.
+DEC_MAX = 90.0          # full sky; per-site reachability is the app's job now
 FRESH_DAYS = 110        # discovery within this window (the app's per-type decay does the
                         # finer cut; this just keeps the published file small)
 MAG_CLASSIFIED = 16.5   # discovery mag ceiling for a spectroscopically classified SN
