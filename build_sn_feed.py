@@ -56,7 +56,8 @@ ENV_BOT_ID = "TNS_BOT_ID"
 ENV_BOT_NAME = "TNS_BOT_NAME"
 HTTP_TIMEOUT = 30
 PRIOR_ATTEMPTS = 3       # anonymous GET of the published feed: retry before giving up
-PRIOR_PAUSE = 5.0        # seconds, scaled by attempt
+PRIOR_PAUSE = 15.0       # seconds, scaled by attempt (15 + 30 s covers DNS still coming up
+                         # after a container/host restart -- the 2026-09-05 11:20 UT wipe)
 DELTA_DAYS = 14          # how many daily-delta files to pull (TNS keeps ~2 weeks)
 DELTA_PAUSE = 2.0        # polite seconds between delta requests (don't look like a scraper)
 BLOCK_ABORT = 3          # this many straight failures with NOTHING fetched -> the runner
@@ -416,10 +417,9 @@ def fetch_prior(url=PRIOR_FEED_URL):
             last = e
             if attempt < PRIOR_ATTEMPTS:
                 time.sleep(PRIOR_PAUSE * attempt)
-    print(f"::warning::prior feed unavailable after {PRIOR_ATTEMPTS} attempts ({last}); "
-          "building from deltas only -- entries older than the delta window WILL drop",
+    print(f"::warning::prior feed unavailable after {PRIOR_ATTEMPTS} attempts ({last})",
           file=sys.stderr)
-    return []
+    return None                                     # caller must NOT publish a deltas-only rebuild
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +656,15 @@ def main():
     else:
         # DEFAULT (rung 2): rolling prior feed + the daily deltas.
         prior = [] if args.no_prior else fetch_prior()
+        if prior is None:
+            # The accumulator is unreachable. A deltas-only rebuild is GUARANTEED lossy
+            # (anything older than the delta window vanishes -- 2026-09-05 11:20 UT: a DNS
+            # hiccup on container start wiped 5 entries down to 1 and every later run
+            # carried the 1 forward). Keep the last-good asset; try again next slot.
+            print("::warning::Previous feed could not be fetched -- NOT rebuilding from deltas "
+                  "alone (that would drop everything older than the delta window). Keeping the "
+                  "last published bright_sne.json.", file=sys.stderr)
+            return
         texts, stats = fetch_tns_deltas(args.delta_days)
         if stats["fetched"] == 0:
             # No fresh delta came through (all throttled/missing). Normally keep the
