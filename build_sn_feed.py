@@ -106,22 +106,34 @@ PEAK_MAX = 16.0         # ...but only if it's predicted to reach this (the app's
 # build day and `obs_date` = the build day; the true anchors ride along as `disc_mag` /
 # `disc_date` and every gate + the model use ONLY those (never the rewritten `mag`, so a
 # carried-forward entry can't compound). App >= 2.3.2 prefers disc_* when present.
-DECAY = {"fast": 0.08, "plateau": 0.015, "slow": 0.005}     # mag/day, mirrors the app
+# Post-peak decay, mag/day, mirrors the app. 'fast' (Ia/Ib/Ic) is TWO-STAGE (Rizzo
+# 07/09): ~0.08 for the first FAST_DAYS after peak, then the ~0.02 radioactive tail --
+# a single 0.08 slope retires a Ia about six weeks early.
+DECAY = {"fast": 0.08, "plateau": 0.015, "slow": 0.005}
+FAST_TAIL = 0.02
+FAST_DAYS = 30
 H0 = 70.0               # km/s/Mpc, for the redshift -> distance-modulus estimate
 C_KMS = 299792.458
-# Typical peak absolute magnitude (rough, B/V) + days from a typical early discovery to
-# peak, per rising family. Taste/physics knobs -- Rizzo to sign off. Unknown -> not rising.
+# Typical peak absolute magnitude (B/V) + rise time from EXPLOSION to peak (T_exp), per
+# rising family. Rizzo-signed 07/09/2026 (Richardson+2014 Ia; Taubenberger 2017 91bg;
+# Foley+2013 Iax; Drout+2011 / Taddia+2019 Ic-BL; De Cia+2018 / Lunnan+2018 SLSN-I;
+# Inserra+2018 SLSN-II; Gal-Yam+2009 SLSN-R; Kasen+2011 PISN). Unknown -> not rising.
 RISING = {
-    # family key: (M_peak, days discovery->peak)
-    "IA":     (-19.3, 15),   # normal Ia: ~18 d rise from explosion, found ~3 d in
-    "IA91BG": (-17.5, 12),   # sub-luminous 91bg-like
-    "IAX":    (-16.0, 12),   # 02cx-like (Iax) -- faint, fast
-    "ICBL":   (-19.0, 12),   # broad-lined Ic = hypernova
-    "SLSNI":  (-21.5, 35),   # superluminous, slow
-    "SLSNII": (-21.0, 35),
-    "SLSNR":  (-21.5, 40),
-    "PISN":   (-21.5, 60),   # pair-instability (theoretical; TNS has no such type yet)
+    # family key: (M_peak, T_exp days)
+    "IA":     (-19.3, 18),
+    "IA91BG": (-17.3, 15),   # sub-luminous 91bg-like
+    "IAX":    (-17.0, 14),   # 02cx-like (Iax): +-1.5 mag scatter, the found ones sit here
+    "ICBL":   (-18.5, 14),   # broad-lined Ic = hypernova
+    "SLSNI":  (-21.2, 40),   # superluminous, slow
+    "SLSNII": (-21.0, 40),
+    "SLSNR":  (-21.3, 70),
+    "PISN":   (-21.5, 120),  # pair-instability (theoretical; TNS has no such type yet)
 }
+Z_MIN = 0.002           # below this (negative included: Virgo members carry z < 0 on TNS)
+                        # peculiar velocity swamps the Hubble flow -> clamp, don't drop
+Z_MAX = 0.2             # above this the K-correction / time dilation we ignore matter;
+                        # nothing that far passes PEAK_MAX anyway -> no prediction
+T0_MIN = 0.5            # days: floor on the fireball's discovery epoch
 # CLASSIFIED-ONLY (2026-07-24): unconfirmed "AT" transients no longer ship AT ALL. The old
 # mag-15.5 "stricter bar" still let AT 2026rdg -- a Galactic classical nova, hostless, blank
 # type at pull time -- ride the feed and render as a "supernova ... in an uncatalogued host
@@ -178,11 +190,13 @@ def _rising_family(sn_type):
 
 
 def _parse_z(s):
+    """TNS redshift -> float, or None when absent/garbled. Negative values are REAL
+    (Virgo members), so they're kept for the clamp in predict_peak, not rejected."""
     try:
         z = float(str(s).strip())
     except (TypeError, ValueError):
         return None
-    return z if 0.0 < z < 2.0 else None
+    return z if -0.01 < z < 2.0 else None
 
 
 def _dist_mod(z):
@@ -195,13 +209,32 @@ def _dist_mod(z):
 
 
 def predict_peak(sn_type, z):
-    """(predicted apparent peak mag, days from discovery to peak) for a rising-watch
-    family with a usable redshift, else (None, None). Pure arithmetic, no I/O."""
+    """(predicted apparent peak mag, T_exp) for a rising-watch family with a usable
+    redshift, else (None, None). z below Z_MIN (negative included) is clamped to Z_MIN --
+    a Virgo Ia is the brightest case there is and must never be dropped for lack of a
+    number; above Z_MAX no prediction. Pure arithmetic, no I/O."""
     fam = _rising_family(sn_type)
-    if fam is None or z is None:
+    if fam is None or z is None or z > Z_MAX:
         return None, None
-    m_abs, days = RISING[fam]
-    return round(m_abs + _dist_mod(z), 1), days
+    m_abs, t_exp = RISING[fam]
+    return round(m_abs + _dist_mod(max(z, Z_MIN)), 1), t_exp
+
+
+def rise_params(disc_mag, peak, t_exp):
+    """Fireball rise (flux ~ t^2; Nugent+2011 on SN 2011fe):
+        m(t) = peak + 5 log10(T_exp / (t + t0)),  t0 = T_exp * 10^(-(disc - peak)/5)
+    Returns (t0, days discovery->peak = T_exp - t0), or (None, None) when there's no
+    brighter peak to rise to. t0 floored at T0_MIN."""
+    if peak is None or t_exp is None or peak >= disc_mag:
+        return None, None
+    t0 = max(T0_MIN, t_exp * 10 ** (-(disc_mag - peak) / 5.0))
+    return round(t0, 2), round(max(0.5, t_exp - t0), 1)
+
+
+def _decay_mag(fam, days_past_peak):
+    if fam == "fast" and days_past_peak > FAST_DAYS:
+        return DECAY["fast"] * FAST_DAYS + FAST_TAIL * (days_past_peak - FAST_DAYS)
+    return DECAY[fam] * days_past_peak
 
 
 def _family(sn_type):
@@ -214,18 +247,17 @@ def _family(sn_type):
     return "fast"
 
 
-def model_mag(disc_mag, disc_date, sn_type, peak, peak_days, today):
-    """The rise model (mirrors the app): m(t) = peak + (disc - peak) * (1 - t/T)^2 while
-    t < T, then peak + type-decay * (t - T). Returns the discovery mag itself when there is
-    no brighter predicted peak (the entry isn't a riser)."""
-    if peak is None or peak >= disc_mag:
+def model_mag(disc_mag, disc_date, sn_type, peak, t_exp, today):
+    """The light curve (mirrors the app): fireball rise to the predicted peak, then the
+    (two-stage for 'fast') type decay. Returns the discovery mag itself when there is no
+    brighter predicted peak (the entry isn't a riser)."""
+    t0, peak_days = rise_params(disc_mag, peak, t_exp)
+    if t0 is None:
         return disc_mag
     t = (today - datetime.strptime(disc_date, "%Y-%m-%d").date()).days
-    T = max(1, int(peak_days or 15))
-    if t < T:
-        frac = 1.0 - t / float(T)
-        return peak + (disc_mag - peak) * frac * frac
-    return peak + DECAY[_family(sn_type)] * (t - T)
+    if t < peak_days:
+        return peak + 5.0 * math.log10(t_exp / (t + t0))
+    return peak + _decay_mag(_family(sn_type), t - peak_days)
 
 
 def _publish_view(e, today):
@@ -233,7 +265,7 @@ def _publish_view(e, today):
     the build day for a riser, the discovery values otherwise. Idempotent on disc_*."""
     if e.get("peak_mag") is not None and e["peak_mag"] < e["disc_mag"]:
         e["mag"] = round(model_mag(e["disc_mag"], e["disc_date"], e.get("type"),
-                                   e["peak_mag"], e.get("peak_days"), today), 1)
+                                   e["peak_mag"], e.get("t_exp"), today), 1)
         e["obs_date"] = today.isoformat()
     else:
         e["mag"] = e["disc_mag"]
@@ -475,7 +507,8 @@ def filter_feed(csv_text, today=None):
         sntype = _clean_type(_get(r, "type"))
         classified = _classified(sntype)
         z = _parse_z(_get(r, "z"))
-        peak, peak_days = predict_peak(sntype, z)
+        peak, t_exp = predict_peak(sntype, z)
+        _t0, peak_days = rise_params(mag, peak, t_exp)
 
         if sntype and not classified:                # confirmed NON-supernova transient
             drop_nonsn += 1                          # (Nova/TDE/CV/Varstar/AGN/...) -- not ours
@@ -507,7 +540,8 @@ def filter_feed(csv_text, today=None):
             # offset_arcsec deliberately omitted -> the app computes it from the host match
             "redshift": z,                           # None when TNS has none
             "peak_mag": peak,                        # predicted apparent peak (None = no prediction)
-            "peak_days": peak_days,                  # days from discovery to that peak
+            "t_exp": t_exp,                          # family rise time, explosion -> peak (days)
+            "peak_days": peak_days,                  # days from DISCOVERY to peak (fireball)
         })
     out.sort(key=lambda s: s["mag"])                 # brightest first
     hdr = (reader.fieldnames or [])[:5]
@@ -546,9 +580,10 @@ def _entry_ok(e, today):
         return False
     if "disc_mag" not in e or "disc_date" not in e:   # pre-2026-09-07 row: mag WAS the discovery
         e["disc_mag"], e["disc_date"] = e.get("mag", 99.0), e.get("obs_date", "")
-    if "peak_mag" not in e:                      # pre-2026-09-07 row: backfill the prediction
+    if "peak_mag" not in e or "t_exp" not in e:  # older row: (re)build the prediction
         e["redshift"] = _parse_z(e.get("redshift"))
-        e["peak_mag"], e["peak_days"] = predict_peak(t, e["redshift"])
+        e["peak_mag"], e["t_exp"] = predict_peak(t, e["redshift"])
+        _t0, e["peak_days"] = rise_params(e.get("disc_mag", 99.0), e["peak_mag"], e["t_exp"])
     dmag = e.get("disc_mag", 99.0)
     if dmag > MAG_CLASSIFIED and not _rising_ok(t, dmag, e.get("peak_mag")):
         return False                             # too faint, and not predicted to brighten
