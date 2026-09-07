@@ -31,6 +31,7 @@ import argparse
 import csv
 import io
 import json
+import math
 import os
 import sys
 import time
@@ -54,6 +55,8 @@ ENV_API_KEY = "TNS_BOT_API_KEY"
 ENV_BOT_ID = "TNS_BOT_ID"
 ENV_BOT_NAME = "TNS_BOT_NAME"
 HTTP_TIMEOUT = 30
+PRIOR_ATTEMPTS = 3       # anonymous GET of the published feed: retry before giving up
+PRIOR_PAUSE = 5.0        # seconds, scaled by attempt
 DELTA_DAYS = 14          # how many daily-delta files to pull (TNS keeps ~2 weeks)
 DELTA_PAUSE = 2.0        # polite seconds between delta requests (don't look like a scraper)
 BLOCK_ABORT = 3          # this many straight failures with NOTHING fetched -> the runner
@@ -82,6 +85,36 @@ DEC_MAX = 90.0          # full sky; per-site reachability is the app's job now
 FRESH_DAYS = 110        # discovery within this window (the app's per-type decay does the
                         # finer cut; this just keeps the published file small)
 MAG_CLASSIFIED = 16.5   # discovery mag ceiling for a spectroscopically classified SN
+
+# RISING WATCH (2026-09-07, Cy): the discovery magnitude is the FAINTEST a supernova is
+# ever reported at -- surveys catch them a day or two after explosion, far down the rise.
+# Gating every classified SN on it silently threw away the ones that matter most: SN
+# 2026aaiv (Ia, NGC 7331) was found by ATLAS at mag 17.3 on 01/09, classified 03/09, and
+# was mag 13.5 with thirty amateur images on the Rochester page by 06/09 while this feed
+# said "nothing". So for the intrinsically-luminous families the rule is now: keep it if
+# it was discovered at MAG_RISING or brighter AND redshift says it should climb into reach
+# (predicted peak <= PEAK_MAX), so people can prep for it before it gets big. The app draws
+# the rise curve from `peak_mag` / `peak_days`; the discovery mag stays in `mag`.
+MAG_RISING = 20.0       # Cy's outer bound: discovery mag ceiling for a rising-watch family
+PEAK_MAX = 16.0         # ...but only if it's predicted to reach this (the app's "patient"
+                        # ceiling). None = publish every rising-family SN under MAG_RISING
+                        # regardless (CAUTION: ~10-20 Ia/day at z~0.05-0.1 that never get
+                        # brighter than 17 -> a huge file + a slow coord-match in the app).
+H0 = 70.0               # km/s/Mpc, for the redshift -> distance-modulus estimate
+C_KMS = 299792.458
+# Typical peak absolute magnitude (rough, B/V) + days from a typical early discovery to
+# peak, per rising family. Taste/physics knobs -- Rizzo to sign off. Unknown -> not rising.
+RISING = {
+    # family key: (M_peak, days discovery->peak)
+    "IA":     (-19.3, 15),   # normal Ia: ~18 d rise from explosion, found ~3 d in
+    "IA91BG": (-17.5, 12),   # sub-luminous 91bg-like
+    "IAX":    (-16.0, 12),   # 02cx-like (Iax) -- faint, fast
+    "ICBL":   (-19.0, 12),   # broad-lined Ic = hypernova
+    "SLSNI":  (-21.5, 35),   # superluminous, slow
+    "SLSNII": (-21.0, 35),
+    "SLSNR":  (-21.5, 40),
+    "PISN":   (-21.5, 60),   # pair-instability (theoretical; TNS has no such type yet)
+}
 # CLASSIFIED-ONLY (2026-07-24): unconfirmed "AT" transients no longer ship AT ALL. The old
 # mag-15.5 "stricter bar" still let AT 2026rdg -- a Galactic classical nova, hostless, blank
 # type at pull time -- ride the feed and render as a "supernova ... in an uncatalogued host
@@ -95,6 +128,7 @@ COL = {
     "ra": ("ra", "radeg"),
     "dec": ("declination", "decdeg", "dec"),
     "type": ("type", "object_type"),
+    "z": ("redshift", "z"),
     "host": ("hostname", "host_name", "host"),
     "discmag": ("discoverymag", "discovery_mag", "discmag"),
     "discdate": ("discoverydate", "discovery_date", "discdate"),
@@ -113,6 +147,64 @@ def _get(row, key):
         if h in row and row[h] not in (None, ""):
             return row[h]
     return None
+
+
+def _rising_family(sn_type):
+    """Bare TNS subtype -> key into RISING, or None when the type is not one of the
+    rising-watch families (Ia*, Ic-BL, SLSN-*, PISN)."""
+    t = (sn_type or "").upper().replace(" ", "").replace("-", "").replace("_", "")
+    if not t:
+        return None
+    if t.startswith("SLSN"):
+        return {"SLSNI": "SLSNI", "SLSNII": "SLSNII", "SLSNR": "SLSNR"}.get(t, "SLSNI")
+    if t.startswith("PISN"):
+        return "PISN"
+    if t.startswith("ICBL"):
+        return "ICBL"
+    if t.startswith("IA"):
+        if "91BG" in t:
+            return "IA91BG"
+        if "02CX" in t or t.startswith("IAX"):
+            return "IAX"
+        return "IA"                 # Ia, Ia-91T, Ia-CSM, Ia-pec, Ia-SC ...
+    return None
+
+
+def _parse_z(s):
+    try:
+        z = float(str(s).strip())
+    except (TypeError, ValueError):
+        return None
+    return z if 0.0 < z < 2.0 else None
+
+
+def _dist_mod(z):
+    """Redshift -> distance modulus (mag). Low-z luminosity distance with the usual
+    second-order term (q0 = -0.55); good to ~0.1 mag for z < 0.1, and the peculiar-
+    velocity scatter below z ~ 0.01 (a few tenths of a mag) is why every predicted
+    peak the app shows is hedged."""
+    d_mpc = (C_KMS * z / H0) * (1.0 + 0.775 * z)
+    return 5.0 * math.log10(d_mpc) + 25.0
+
+
+def predict_peak(sn_type, z):
+    """(predicted apparent peak mag, days from discovery to peak) for a rising-watch
+    family with a usable redshift, else (None, None). Pure arithmetic, no I/O."""
+    fam = _rising_family(sn_type)
+    if fam is None or z is None:
+        return None, None
+    m_abs, days = RISING[fam]
+    return round(m_abs + _dist_mod(z), 1), days
+
+
+def _rising_ok(sn_type, mag, peak):
+    """The rising-watch rule: a rising-family SN discovered at MAG_RISING or brighter
+    whose predicted peak reaches PEAK_MAX (or any predicted peak when PEAK_MAX is None)."""
+    if _rising_family(sn_type) is None or mag > MAG_RISING:
+        return False
+    if PEAK_MAX is None:
+        return True
+    return peak is not None and peak <= PEAK_MAX
 
 
 # ---------------------------------------------------------------------------
@@ -228,15 +320,22 @@ def fetch_prior(url=PRIOR_FEED_URL):
     delta-window cliff). No TNS, no auth, no throttle. NEVER raises -- on any failure we
     just build from the deltas alone."""
     import urllib.request
-    try:
-        with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as r:
-            doc = json.loads(r.read().decode("utf-8", "replace"))
-        ents = [e for e in doc.get("supernovae", []) if e.get("name")]
-        print(f"[diag] prior feed: {len(ents)} entries carried forward", file=sys.stderr)
-        return ents
-    except Exception as e:
-        print(f"[diag] prior feed unavailable ({e}); building from deltas only", file=sys.stderr)
-        return []
+    last = None
+    for attempt in range(1, PRIOR_ATTEMPTS + 1):    # one flaky GET must not wipe the accumulator
+        try:
+            with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as r:
+                doc = json.loads(r.read().decode("utf-8", "replace"))
+            ents = [e for e in doc.get("supernovae", []) if e.get("name")]
+            print(f"[diag] prior feed: {len(ents)} entries carried forward", file=sys.stderr)
+            return ents
+        except Exception as e:
+            last = e
+            if attempt < PRIOR_ATTEMPTS:
+                time.sleep(PRIOR_PAUSE * attempt)
+    print(f"::warning::prior feed unavailable after {PRIOR_ATTEMPTS} attempts ({last}); "
+          "building from deltas only -- entries older than the delta window WILL drop",
+          file=sys.stderr)
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +422,8 @@ def filter_feed(csv_text, today=None):
             continue                                 # skip incomplete/garbled rows
         sntype = _clean_type(_get(r, "type"))
         classified = _classified(sntype)
+        z = _parse_z(_get(r, "z"))
+        peak, peak_days = predict_peak(sntype, z)
 
         if sntype and not classified:                # confirmed NON-supernova transient
             drop_nonsn += 1                          # (Nova/TDE/CV/Varstar/AGN/...) -- not ours
@@ -337,9 +438,9 @@ def filter_feed(csv_text, today=None):
         if age < 0 or age > FRESH_DAYS:             # not recent enough
             drop_age += 1
             continue
-        if mag > MAG_CLASSIFIED:
+        if mag > MAG_CLASSIFIED and not _rising_ok(sntype, mag, peak):
             drop_faint += 1
-            continue                                 # too faint
+            continue                                 # too faint, and not predicted to brighten
 
         out.append({
             "name": f"{prefix} {name}".strip(),
@@ -350,12 +451,15 @@ def filter_feed(csv_text, today=None):
             "mag": round(mag, 1),
             "obs_date": ddate,
             # offset_arcsec deliberately omitted -> the app computes it from the host match
+            "redshift": z,                           # None when TNS has none
+            "peak_mag": peak,                        # predicted apparent peak (None = no prediction)
+            "peak_days": peak_days,                  # days from discovery to that peak
         })
     out.sort(key=lambda s: s["mag"])                 # brightest first
     hdr = (reader.fieldnames or [])[:5]
     print(f"[diag] header={hdr} rows_seen={seen} kept={len(out)} | dropped: "
           f"non-SN={drop_nonsn} unclassified-AT={drop_unclass} north={drop_north} "
-          f"stale={drop_age} faint={drop_faint} bad/incomplete={drop_bad}", file=sys.stderr)
+          f"stale={drop_age} faint(not rising)={drop_faint} bad/incomplete={drop_bad}", file=sys.stderr)
     return out
 
 
@@ -386,8 +490,11 @@ def _entry_ok(e, today):
         return False                             # unconfirmed AT -- not a supernova (yet)
     if e.get("dec", 0.0) > DEC_MAX:              # unreachable north
         return False
-    if e.get("mag", 99.0) > MAG_CLASSIFIED:      # too faint
-        return False
+    if "peak_mag" not in e:                      # pre-2026-09-07 row: backfill the prediction
+        e["redshift"] = _parse_z(e.get("redshift"))
+        e["peak_mag"], e["peak_days"] = predict_peak(t, e["redshift"])
+    if e.get("mag", 99.0) > MAG_CLASSIFIED and not _rising_ok(t, e.get("mag", 99.0), e.get("peak_mag")):
+        return False                             # too faint, and not predicted to brighten
     try:
         age = (today - datetime.strptime(e["obs_date"], "%Y-%m-%d").date()).days
     except (KeyError, ValueError):
