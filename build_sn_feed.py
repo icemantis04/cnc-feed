@@ -100,6 +100,13 @@ PEAK_MAX = 16.0         # ...but only if it's predicted to reach this (the app's
                         # ceiling). None = publish every rising-family SN under MAG_RISING
                         # regardless (CAUTION: ~10-20 Ia/day at z~0.05-0.1 that never get
                         # brighter than 17 -> a huge file + a slow coord-match in the app).
+# SHIPPED-APP COMPATIBILITY: apps up to 2.3.1 read `mag` + `obs_date` and fade forward
+# from them, so a rising entry published with its discovery mag (17.3) is invisible to
+# them. For a rising entry we therefore publish `mag` = the rise model's estimate for the
+# build day and `obs_date` = the build day; the true anchors ride along as `disc_mag` /
+# `disc_date` and every gate + the model use ONLY those (never the rewritten `mag`, so a
+# carried-forward entry can't compound). App >= 2.3.2 prefers disc_* when present.
+DECAY = {"fast": 0.08, "plateau": 0.015, "slow": 0.005}     # mag/day, mirrors the app
 H0 = 70.0               # km/s/Mpc, for the redshift -> distance-modulus estimate
 C_KMS = 299792.458
 # Typical peak absolute magnitude (rough, B/V) + days from a typical early discovery to
@@ -195,6 +202,51 @@ def predict_peak(sn_type, z):
         return None, None
     m_abs, days = RISING[fam]
     return round(m_abs + _dist_mod(z), 1), days
+
+
+def _family(sn_type):
+    """MIRRORED from the app's supernovae._family: fade family by type."""
+    t = (sn_type or "").upper().replace(" ", "").replace("-", "")
+    if t.startswith("IIN") or t.startswith("SLSN"):
+        return "slow"
+    if t.startswith("II"):
+        return "plateau"
+    return "fast"
+
+
+def model_mag(disc_mag, disc_date, sn_type, peak, peak_days, today):
+    """The rise model (mirrors the app): m(t) = peak + (disc - peak) * (1 - t/T)^2 while
+    t < T, then peak + type-decay * (t - T). Returns the discovery mag itself when there is
+    no brighter predicted peak (the entry isn't a riser)."""
+    if peak is None or peak >= disc_mag:
+        return disc_mag
+    t = (today - datetime.strptime(disc_date, "%Y-%m-%d").date()).days
+    T = max(1, int(peak_days or 15))
+    if t < T:
+        frac = 1.0 - t / float(T)
+        return peak + (disc_mag - peak) * frac * frac
+    return peak + DECAY[_family(sn_type)] * (t - T)
+
+
+def _publish_view(e, today):
+    """Set the legacy `mag`/`obs_date` pair a shipped app reads: the model's estimate for
+    the build day for a riser, the discovery values otherwise. Idempotent on disc_*."""
+    if e.get("peak_mag") is not None and e["peak_mag"] < e["disc_mag"]:
+        e["mag"] = round(model_mag(e["disc_mag"], e["disc_date"], e.get("type"),
+                                   e["peak_mag"], e.get("peak_days"), today), 1)
+        e["obs_date"] = today.isoformat()
+    else:
+        e["mag"] = e["disc_mag"]
+        e["obs_date"] = e["disc_date"]
+    return e
+
+
+def finalize(entries, today):
+    """Re-validate against the gates (anchored on disc_*), stamp the publish view,
+    brightest first. Every path that writes a feed goes through here."""
+    kept = [_publish_view(e, today) for e in entries if _entry_ok(e, today)]
+    kept.sort(key=lambda s: s.get("mag", 99.0))
+    return kept
 
 
 def _rising_ok(sn_type, mag, peak):
@@ -448,8 +500,10 @@ def filter_feed(csv_text, today=None):
             "ra_hours": round(ra / 15.0, 5),
             "dec": round(dec, 5),
             "type": sntype,                          # bare subtype or '' (unclassified)
-            "mag": round(mag, 1),
-            "obs_date": ddate,
+            "mag": round(mag, 1),                    # rewritten by finalize() for a riser
+            "obs_date": ddate,                       # (see the compatibility note up top)
+            "disc_mag": round(mag, 1),               # the true anchors
+            "disc_date": ddate,
             # offset_arcsec deliberately omitted -> the app computes it from the host match
             "redshift": z,                           # None when TNS has none
             "peak_mag": peak,                        # predicted apparent peak (None = no prediction)
@@ -472,7 +526,7 @@ def build(csv_text, source):
         "schema_version": 1,
         "generated_at": _now_iso(),
         "source": source,
-        "supernovae": filter_feed(csv_text),
+        "supernovae": finalize(filter_feed(csv_text), datetime.now(timezone.utc).date()),
     }
 
 
@@ -490,14 +544,17 @@ def _entry_ok(e, today):
         return False                             # unconfirmed AT -- not a supernova (yet)
     if e.get("dec", 0.0) > DEC_MAX:              # unreachable north
         return False
+    if "disc_mag" not in e or "disc_date" not in e:   # pre-2026-09-07 row: mag WAS the discovery
+        e["disc_mag"], e["disc_date"] = e.get("mag", 99.0), e.get("obs_date", "")
     if "peak_mag" not in e:                      # pre-2026-09-07 row: backfill the prediction
         e["redshift"] = _parse_z(e.get("redshift"))
         e["peak_mag"], e["peak_days"] = predict_peak(t, e["redshift"])
-    if e.get("mag", 99.0) > MAG_CLASSIFIED and not _rising_ok(t, e.get("mag", 99.0), e.get("peak_mag")):
+    dmag = e.get("disc_mag", 99.0)
+    if dmag > MAG_CLASSIFIED and not _rising_ok(t, dmag, e.get("peak_mag")):
         return False                             # too faint, and not predicted to brighten
     try:
-        age = (today - datetime.strptime(e["obs_date"], "%Y-%m-%d").date()).days
-    except (KeyError, ValueError):
+        age = (today - datetime.strptime(e["disc_date"], "%Y-%m-%d").date()).days
+    except (KeyError, ValueError, TypeError):
         return False
     return 0 <= age <= FRESH_DAYS
 
@@ -522,8 +579,7 @@ def build_deltas(delta_texts, prior_entries, source):
     for text in reversed(delta_texts):          # oldest -> newest so newest info wins
         for e in filter_feed(text):
             acc[_desig(e["name"])] = e
-    kept = [e for e in acc.values() if _entry_ok(e, today)]  # self-heal: re-validate ALL
-    kept.sort(key=lambda s: s.get("mag", 99.0))               # brightest first
+    kept = finalize(list(acc.values()), today)  # self-heal: re-validate ALL, stamp publish view
     print(f"[diag] merged feed: {len(acc)} candidates -> {len(kept)} kept after re-validation "
           f"(non-SN / north / faint / >{FRESH_DAYS}d purged)", file=sys.stderr)
     return {
@@ -574,9 +630,8 @@ def main():
             # block: republish the healed prior-only feed. This is how the classified-only
             # gate purges junk like AT 2026rdg the same day it lands, block or no block.
             today = datetime.now(timezone.utc).date()
-            healed = [e for e in prior if _entry_ok(e, today)]
+            healed = finalize(list(prior), today)
             if prior and len(healed) < len(prior):
-                healed.sort(key=lambda s: s.get("mag", 99.0))
                 print(f"::warning::No daily deltas fetched "
                       f"(missing={stats['missing']} throttled={stats['throttled']}), but "
                       f"re-validation drops {len(prior) - len(healed)} of {len(prior)} "
